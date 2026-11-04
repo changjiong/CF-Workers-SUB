@@ -1,0 +1,39 @@
+name: Refresh upstream subscription cache
+
+# 定时拉取聚合订阅框（KV: LINK.txt）里的上游订阅并写入 KV 缓存，
+# 供 _worker.js 在实时拉取失败（如上游证书过期）时回退使用。
+#
+# 需要的 Secrets：
+#   CF_API_TOKEN        Cloudflare API Token，权限仅需 Account → Workers KV Storage → Edit
+#   CF_ACCOUNT_ID       Cloudflare 账号 ID
+#   CF_KV_NAMESPACE_ID  Pages 项目绑定为 KV 的命名空间 ID
+
+on:
+  schedule:
+    - cron: "17 * * * *" # 每小时一次（GitHub 定时任务可能有延迟）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-cache
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Refresh cache
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+        run: python3 -I .github/scripts/refresh_cache.py
