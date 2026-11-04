@@ -122,7 +122,7 @@ export default {
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()); // 去重
 			if (订阅链接数组.length > 0) {
-				const 请求订阅响应内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader);
+				const 请求订阅响应内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, env);
 				console.log(请求订阅响应内容);
 				req_data += 请求订阅响应内容[0].join('\n');
 				订阅转换URL += "|" + 请求订阅响应内容[1];
@@ -366,7 +366,29 @@ async function proxyURL(proxyURL, url) {
 	return newResponse;
 }
 
-async function getSUB(api, request, 追加UA, userAgentHeader) {
+// 上游订阅缓存：由 GitHub Actions（.github/workflows/refresh-cache.yml）定时拉取后写入 KV。
+// 实时拉取失败（如上游证书过期，Workers 的 fetch 无法跳过证书校验）时回退使用。
+// 键名必须与 .github/scripts/refresh_cache.py 中的 cache_key() 保持一致。
+async function 订阅缓存键(url) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url));
+	return 'cache:' + Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function 读取订阅缓存(env, url) {
+	if (!env || !env.KV) return '';
+	try {
+		return (await env.KV.get(await 订阅缓存键(url))) || '';
+	} catch (error) {
+		console.error('读取订阅缓存失败:', error);
+		return '';
+	}
+}
+
+function 订阅域名(url) {
+	return url.split('://')[1].split('/')[0];
+}
+
+async function getSUB(api, request, 追加UA, userAgentHeader, env) {
 	if (!api || api.length === 0) {
 		return [];
 	} else api = [...new Set(api)]; // 去重
@@ -410,7 +432,24 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
 
 		console.log(modifiedResponses); // 输出修改后的响应数组
 
+		// 实时拉取失败或内容异常时：优先使用 KV 缓存，没有缓存则插入可见的占位节点，避免静默丢失
+		const 使用缓存或占位 = async (apiUrl, 原因) => {
+			const 缓存内容 = await 读取订阅缓存(env, apiUrl);
+			if (缓存内容) {
+				console.log(`${原因}，使用缓存: ${订阅域名(apiUrl)}`);
+				newapi += 缓存内容 + '\n';
+				return;
+			}
+			const 占位LINK = `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#${encodeURIComponent(`${原因} ${订阅域名(apiUrl)}`)}`;
+			console.log(`${原因}且无缓存: ${占位LINK}`);
+			异常订阅 += `${占位LINK}\n`;
+		};
+
 		for (const response of modifiedResponses) {
+			if (response.status !== 'fulfilled') {
+				await 使用缓存或占位(response.apiUrl, response.status === '超时' ? '订阅超时' : '请求失败');
+				continue;
+			}
 			// 检查响应状态是否为'fulfilled'
 			if (response.status === 'fulfilled') {
 				const content = await response.value || 'null'; // 获取响应的内容
@@ -427,9 +466,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
 					//console.log('Base64订阅: ' + response.apiUrl);
 					newapi += base64Decode(content) + '\n'; // 解码并追加内容
 				} else {
-					const 异常订阅LINK = `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#%E5%BC%82%E5%B8%B8%E8%AE%A2%E9%98%85%20${response.apiUrl.split('://')[1].split('/')[0]}`;
-					console.log('异常订阅: ' + 异常订阅LINK);
-					异常订阅 += `${异常订阅LINK}\n`;
+					await 使用缓存或占位(response.apiUrl, '异常订阅');
 				}
 			}
 		}
@@ -454,15 +491,8 @@ async function getUrl(request, targetUrl, 追加UA, userAgentHeader) {
 		method: request.method,
 		headers: newHeaders,
 		body: request.method === "GET" ? null : request.body,
-		redirect: "follow",
-		cf: {
-			// 忽略SSL证书验证
-			insecureSkipVerify: true,
-			// 允许自签名证书
-			allowUntrusted: true,
-			// 禁用证书验证
-			validateCertificate: false
-		}
+		redirect: "follow"
+		// 注意：Workers 的 fetch 不支持跳过证书校验，证书无效的上游会请求失败，由 KV 缓存兜底
 	});
 
 	// 输出请求的详细信息
